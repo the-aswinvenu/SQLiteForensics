@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"winsock2.h": "c",
+			"stdio.h": "c",
+			"typeinfo": "c"
+		}
+	}
+}

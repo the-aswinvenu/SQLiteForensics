@@ -1,0 +1,33 @@
+{
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C/C++: gcc.exe build all files",
+            "command": "gcc",
+            "args": [
+                "-g",
+                "main.c",
+                "generalFunctions.c",
+                "leafHandler.c",
+                "bTree.c",
+                "dataExtract.c",
+                "recovery.c",
+                "-lws2_32",
+                "-o",
+                "RecoverSQLiteDB",
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Compiling all files into exe"
+        }
+    ],
+    "version": "2.0.0"
+}
