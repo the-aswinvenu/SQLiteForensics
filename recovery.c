@@ -6,13 +6,19 @@
 // Array to hold all freelist page numbers
 int freelist_pages[MAX_FREELIST_PAGES];
 int freelist_page_count = 0;
+FILE *csv_stalecells = NULL;
+FILE *csv_cellslack = NULL;
+FILE *csv_pageslack = NULL;
+FILE *csv_freeblock = NULL;
+FILE *csv_freelist = NULL;
+FILE *csv_orphanpages = NULL;
 
 /*------------------------------------------------------------------------------------------------------------------------------*/
 
 void parseFreelistPages()
 {
     int trunk_page = header.freelist_trunk;
-    int total_pages = header.freelist_count;
+    int total_pages = header.freelist_count - 1;
 
     printf("\n[+] Freelist Metadata:\n");
     printf("    Trunk Page Start : %d\n", trunk_page);
@@ -62,57 +68,79 @@ void parseFreelistPages()
     printf("\n[+] Total Freelist Pages Found: %d\n", freelist_page_count);
 }
 
-/*------------------------------------------------------------------------------------------------------------------------------*/
-
-void getFreeblockData()
+void analyzeFreelistPages()
 {
-    for (int i = 1; i <= header.db_size_pages; i++)
+    fseek(fp, 0x20, SEEK_SET);
+    uint32_t trunk_page;
+    fread(&trunk_page, 4, 1, fp);
+    trunk_page = __builtin_bswap32(trunk_page); // convert BE to host
+
+    while (trunk_page != 0)
     {
-        int page_number = i;
-        fseek(fp, (page_number == 1 ? 0 : (page_number - 1) * header.page_size), SEEK_SET);
+        uint32_t trunk_offset = (trunk_page - 1) * header.page_size;
+        fseek(fp, trunk_offset, SEEK_SET);
 
-        unsigned char *page = malloc(header.page_size);
-        if (!page)
-            continue;
+        // Read next trunk page
+        uint32_t next_trunk;
+        fread(&next_trunk, 4, 1, fp);
+        next_trunk = __builtin_bswap32(next_trunk);
 
-        if (fread(page, 1, header.page_size, fp) != header.page_size)
+        // Read number of leaf pages
+        uint32_t leaf_count;
+        fread(&leaf_count, 4, 1, fp);
+        leaf_count = __builtin_bswap32(leaf_count);
+
+        for (uint32_t i = 0; i < leaf_count; i++)
         {
-            fprintf(stderr, "Error reading page %d\n", page_number);
-            free(page);
-            continue;
-        }
+            uint32_t leaf_page;
+            fseek(fp, trunk_offset + 8 + (i * 4), SEEK_SET);
+            fread(&leaf_page, 4, 1, fp);
+            leaf_page = __builtin_bswap32(leaf_page);
 
-        unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
-        uint16_t freeblock_offset = (ptr[OFFSET1] << BYTE_SHIFT_8) | ptr[OFFSET2]; // Bytes 1-2 of page header
-
-        while (freeblock_offset != 0 && freeblock_offset < header.page_size - OFFSET4)
-        {
-            unsigned char *fb_ptr = ptr + freeblock_offset;
-            uint16_t next_fb_offset = (fb_ptr[OFFSET0] << BYTE_SHIFT_8) | fb_ptr[OFFSET1];
-            uint16_t fb_size = (fb_ptr[OFFSET2] << BYTE_SHIFT_8) | fb_ptr[OFFSET3];
-
-            printf("\n[Freeblock found]");
-            printf("\nPage       : %d", page_number);
-            printf("\nOffset     : %d", freeblock_offset);
-            printf("\nSize       : %d bytes", fb_size);
-            printf("\nRaw Content: ");
-
-            // Print content in ASCII where printable
-            for (int j = 4; j < fb_size && (freeblock_offset + j) < header.page_size; j++)
+            uint32_t leaf_offset = (leaf_page - 1) * header.page_size;
+            fseek(fp, leaf_offset, SEEK_SET);
+            unsigned char *page = malloc(header.page_size);
+            if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
             {
-                unsigned char c = fb_ptr[j];
-                if (c >= 32 && c <= 126)
-                    printf("%c", c);
-                else if (c != 0)
-                    printf(".");
+                free(page);
+                continue;
             }
-            printf("\n");
 
-            // Move to next freeblock
-            freeblock_offset = next_fb_offset;
+            // Analyze leaf page using parseCell()
+            int table_index = getSchemaIndexByPage(leaf_page);
+            if (table_index == -1)
+            {
+                free(page);
+                continue;
+            }
+
+            printf("[FREEPAGE %u] analyzing from offset 0\n", leaf_page);
+            for (int offset = 0; offset < header.page_size - 8;)
+            {
+                ParsedRow row;
+                int consumed = 0;
+                if (parseCell(page, offset, table_index, &row, &consumed) && consumed > 0)
+                {
+                    fprintf(csv_freelist, "[RECOVERED: FREE-PAGE %u OFFSET %d],", leaf_page, offset);
+                    for (int j = 0; j < row.column_count; j++)
+                    {
+                        fprintf(csv_freelist, "%s", row.values[j]);
+                        if (j < row.column_count - 1)
+                            fprintf(csv_freelist, ",");
+                    }
+                    fprintf(csv_freelist, "\n");
+                    offset += consumed;
+                }
+                else
+                {
+                    offset++;
+                }
+            }
+
+            free(page);
         }
 
-        free(page);
+        trunk_page = next_trunk;
     }
 }
 
@@ -120,167 +148,574 @@ void getFreeblockData()
 
 void extractCellSlack()
 {
-    for (int i = 1; i <= header.db_size_pages; i++)
+    fprintf(csv_cellslack, "\n[Slack Between Active Cells]\n");
+    for (int page_number = 1; page_number <= header.db_size_pages; page_number++)
     {
-        int page_number = i;
-        fseek(fp, (page_number == 1 ? 0 : (page_number - 1) * header.page_size), SEEK_SET);
+        printf("\n Page number: %d\n", page_number);
+        fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
         unsigned char *page = malloc(header.page_size);
-        fread(page, 1, header.page_size, fp);
-        unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+        if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+        {
+            free(page);
+            continue;
+        }
 
-        uint16_t cell_count = (ptr[OFFSET3] << BYTE_SHIFT_8) | ptr[OFFSET4];
+        unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+        uint8_t page_type = ptr[OFFSET0];
+
+        if (page_type != TABLE_LEAF_PAGE && page_type != TABLE_INTERIOR_PAGE &&
+            page_type != INDEX_LEAF_PAGE && page_type != INDEX_INTERIOR_PAGE)
+        {
+            free(page);
+            continue;
+        }
+
+        uint16_t cell_count = (ptr[OFFSET3] << 8) | ptr[OFFSET4];
+        uint16_t content_start_offset = (ptr[OFFSET5] << 8) | ptr[OFFSET6];
+        if (cell_count == 0 && content_start_offset == header.page_size)
+        {
+            free(page);
+            continue;
+        }
+
+        // Read all cell offsets
+        int hdr_offset = (page_type == TABLE_INTERIOR_PAGE || page_type == INDEX_INTERIOR_PAGE) ? 12 : 8;
         uint16_t cell_offsets[cell_count];
 
         for (int i = 0; i < cell_count; i++)
         {
-            cell_offsets[i] = (ptr[CELL_PTR_ARRAY_OFFSET + i * 2] << BYTE_SHIFT_8) | ptr[CELL_PTR_ARRAY_OFFSET + i * 2 + 1];
+            cell_offsets[i] = (ptr[hdr_offset + i * 2] << 8) | ptr[hdr_offset + i * 2 + 1];
         }
 
-        // Sort offsets
+        // Sort cell offsets (lowest to highest)
         for (int i = 0; i < cell_count - 1; i++)
         {
             for (int j = i + 1; j < cell_count; j++)
             {
                 if (cell_offsets[i] > cell_offsets[j])
                 {
-                    uint16_t temp = cell_offsets[i];
+                    uint16_t tmp = cell_offsets[i];
                     cell_offsets[i] = cell_offsets[j];
-                    cell_offsets[j] = temp;
+                    cell_offsets[j] = tmp;
                 }
             }
         }
 
-        printf("\nSlack spaces on page %d:\n", page_number);
+        printf("\nPage %d:\n", page_number);
         for (int i = 0; i < cell_count - 1; i++)
         {
-            unsigned char *end_of_current = ptr + cell_offsets[i];
-            unsigned char *start_of_next = ptr + cell_offsets[i + 1];
+            uint16_t cur_offset = cell_offsets[i];
+            int consumed = 0;
+            int table_index = getSchemaIndexByPage(page_number);
+            if (table_index == -1)
+                continue;
 
-            int slack_size = start_of_next - (end_of_current + 1);
-            if (slack_size > 0)
+            ParsedRow row;
+            if (!parseCell(ptr, cur_offset, table_index, &row, &consumed) || consumed <= 0)
+                continue;
+
+            uint16_t end_of_cell = cur_offset + consumed;
+            uint16_t next_cell = cell_offsets[i + 1];
+
+            // If no slack in between, skip
+            if (next_cell <= end_of_cell)
+                continue;
+
+            // Parse the slack space
+            for (int offset = end_of_cell; offset + 8 < next_cell;)
             {
-                printf("Between cells %d and %d: ", i + 1, i + 2);
-                for (unsigned char *s = end_of_current + 1; s < start_of_next; s++)
+                ParsedRow slack_row;
+                int slack_consumed = 0;
+
+                if (parseCell(ptr, offset, table_index, &slack_row, &slack_consumed) && slack_consumed > 0)
                 {
-                    // if ((*s >= 48 && *s <= 57) || (*s >= 65 && *s <= 90) || (*s >= 97 && *s <= 122))
-                    if (*s >= 32 && *s <= 126)
-                        printf("%c", *s);
-                    else
-                        printf(".");
+                    // fprintf(csv_recovered, "%s", slack_row.values[j]);
+                    printf("[Slack-Recovered at %d]: ", offset);
+                    fprintf(csv_cellslack, "(\n");
+                    for (int j = 0; j < slack_row.column_count; j++)
+                    {
+                        // printf("%s", slack_row.values[j]);
+                        fprintf(csv_cellslack, "%s", slack_row.values[j]);
+                        if (j < slack_row.column_count - 1)
+                            fprintf(csv_cellslack, ",");
+                    }
+                    fprintf(csv_cellslack, ")\n");
+                    offset += slack_consumed;
                 }
-                printf("\n");
+                else
+                {
+                    offset++;
+                }
             }
         }
+
         free(page);
     }
 }
 
 /*------------------------------------------------------------------------------------------------------------------------------*/
 
-// void extractPageSlack(int page_number)
-// {
-//     fseek(fp, (page_number == 1 ? 0 : (page_number - 1) * header.page_size), SEEK_SET);
-//     unsigned char *page = malloc(header.page_size);
-//     fread(page, 1, header.page_size, fp);
-//     unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
-// }
-
-/*------------------------------------------------------------------------------------------------------------------------------*/
-
-void carveFreeblockRecords(int page_number, unsigned char *page, int offset, int size)
+void extractPageSlack()
 {
-    int end = offset + size;
-    while (offset < end)
+    fprintf(csv_pageslack, "\n[Recovered from page slack]\n");
+    for (int page_number = 1; page_number <= header.db_size_pages; page_number++)
     {
-        int n, header_offset = 0;
-        uint64_t payload = readVarint(page + offset, &n);
-        if (n <= 0 || offset + n >= end)
-            break;
-        offset += n;
-
-        uint64_t rowid = readVarint(page + offset, &n);
-        if (n <= 0 || offset + n >= end)
-            break;
-        offset += n;
-
-        uint64_t header_size = readVarint(page + offset, &n);
-        if (n <= 0 || offset + n >= end)
-            break;
-        offset += n;
-
-        unsigned char *header = page + offset;
-        header_offset = 0;
-
-        // Try to decode serial types (heuristic limit)
-        uint64_t serial_types[MAX_COLUMNS];
-        int num_columns = 0;
-
-        while ((offset + header_offset) < end && header_offset < header_size && num_columns < MAX_COLUMNS)
+        printf("\n Page number: %d\n", page_number);
+        fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
+        unsigned char *page = malloc(header.page_size);
+        if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
         {
-            serial_types[num_columns] = readVarint(header + header_offset, &n);
-            if (n <= 0)
-                break;
-            header_offset += n;
-            num_columns++;
-        }
-
-        if (num_columns == 0 || offset + header_offset >= end)
-        {
-            offset++; // shift forward and retry
+            free(page);
             continue;
         }
 
-        // Now read actual record content
-        unsigned char *content = page + offset + header_offset;
-        int content_offset = 0;
+        unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+        uint8_t page_type = ptr[0];
 
-        printf("Recovered record at offset %d (page %d): (", offset, page_number);
-        for (int i = 0; i < num_columns; i++)
+        if (page_type != TABLE_LEAF_PAGE && page_type != TABLE_INTERIOR_PAGE &&
+            page_type != INDEX_LEAF_PAGE && page_type != INDEX_INTERIOR_PAGE)
         {
-            uint64_t stype = serial_types[i];
+            printf("\nPage no: %d\n", page_number);
+            free(page);
+            continue;
+        }
 
-            if (stype == 0)
+        uint16_t num_cells = (ptr[OFFSET3] << 8) | ptr[OFFSET4];
+        uint16_t content_start = (ptr[OFFSET5] << 8) | ptr[OFFSET6];
+        if (content_start == 0)
+            content_start = header.page_size;
+
+        // Skip empty interior pages
+        if (num_cells == 0 && content_start == header.page_size)
+        {
+            free(page);
+            continue;
+        }
+
+        // Calculate start of cell pointer array end
+        int header_offset = (page_type == TABLE_INTERIOR_PAGE || page_type == INDEX_INTERIOR_PAGE) ? 12 : 8;
+        int slack_start = header_offset + (2 * num_cells);
+        int slack_end = content_start;
+
+        int offset = slack_start;
+
+        while (offset < slack_end)
+        {
+            if (ptr[offset] == 0x00)
             {
-                printf("%llu", rowid);
+                offset++;
+                continue;
             }
-            else if (stype >= 13 && stype % 2 == 1)
+
+            int table_index = getSchemaIndexByPage(page_number);
+            if (table_index == -1)
             {
-                int len = (stype - 13) / 2;
-                if (content_offset + len > size)
-                    break;
-                char *text = malloc(len + 1);
-                memcpy(text, content + content_offset, len);
-                text[len] = '\0';
-                printf("'%s'", text);
-                free(text);
-                content_offset += len;
+                offset++;
+                continue;
             }
-            else if (stype >= 1 && stype <= 6)
+
+            ParsedRow row;
+            int consumed = 0;
+
+            if (parseCell(ptr, offset, table_index, &row, &consumed) && consumed > 0)
             {
-                int sz = (stype == 1) ? 1 : (stype == 2) ? 2
-                                        : (stype == 3)   ? 3
-                                        : (stype == 4)   ? 4
-                                        : (stype == 5)   ? 6
-                                                         : 8;
-                if (content_offset + sz > size)
+                static int header_written[MAX_TABLES] = {0};
+                if (!header_written[table_index])
+                {
+                    fprintf(csv_pageslack, "Recovered from page %d\n", page_number);
+                    fprintf(csv_pageslack, "Possible Table: %s\n", objects[table_index].name);
+                    for (int j = 0; j < row.column_count; j++)
+                    {
+                        fprintf(csv_pageslack, "%s", objects[table_index].columns[j].name);
+                        if (j < row.column_count - 1)
+                            fprintf(csv_pageslack, ",");
+                    }
+                    fprintf(csv_pageslack, "\n");
+                    header_written[table_index] = 1;
+                }
+
+                // fprintf(csv_recovered, "[RECOVERED: pg %d @ offset %d],", page_number, offset);
+                for (int j = 0; j < row.column_count; j++)
+                {
+                    fprintf(csv_pageslack, "%s", row.values[j]);
+                    if (j < row.column_count - 1)
+                        fprintf(csv_pageslack, ",");
+                }
+                fprintf(csv_pageslack, "\n");
+
+                offset += consumed;
+            }
+            else
+                offset++;
+        }
+        free(page);
+    }
+}
+/*------------------------------------------------------------------------------------------------------------------------------*/
+
+void carveFreeblocksRecords()
+{
+    fprintf(csv_freeblock, "\n[FreeBlock Data]\n");
+    for (int page_number = 1; page_number <= header.db_size_pages; page_number++)
+    {
+        fseek(fp, ((page_number - 1) * header.page_size), SEEK_SET);
+        unsigned char *page = malloc(header.page_size);
+        if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+        {
+            free(page);
+            continue;
+        }
+
+        unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+        uint16_t offset = (ptr[OFFSET1] << BYTE_SHIFT_8) | ptr[OFFSET2];
+
+        if (ptr[0] != TABLE_LEAF_PAGE && ptr[0] != TABLE_INTERIOR_PAGE &&
+            ptr[0] != INDEX_LEAF_PAGE && ptr[0] != INDEX_INTERIOR_PAGE)
+        {
+            free(page);
+            continue;
+        }
+
+        while (offset && offset < header.page_size - 4)
+        {
+            unsigned char *fb = ptr + offset;
+            uint16_t next = (fb[OFFSET0] << BYTE_SHIFT_8) | fb[OFFSET1];
+            uint16_t size = (fb[OFFSET2] << BYTE_SHIFT_8) | fb[OFFSET3];
+
+            for (int i = 4; i < size - 8;)
+            {
+                ParsedRow row;
+                int consumed = 0;
+                if (parseCell(fb, i, 0, &row, &consumed) && consumed > 0)
+                {
+                    fprintf(csv_freeblock, "Page %d Offset %d,", page_number, offset + i);
+                    for (int j = 0; j < row.column_count; j++)
+                    {
+                        fprintf(csv_freeblock, "%s", row.values[j]);
+                        if (j < row.column_count - 1)
+                            fprintf(csv_freeblock, ",");
+                    }
+                    fprintf(csv_freeblock, "\n");
+
+                    i += consumed;
+                }
+                else
+                {
+                    i++; // move forward byte by byte if not valid
+                }
+            }
+
+            offset = next;
+        }
+
+        free(page);
+    }
+}
+
+/*------------------------------------------------------------------------------------------------------------------------------*/
+
+void recoverStaleCells()
+{
+    fprintf(csv_stalecells, "[Stale cell data]\n");
+    for (int page_number = 1; page_number <= header.db_size_pages; page_number++)
+    {
+        fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
+        unsigned char *page = malloc(header.page_size);
+        if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+        {
+            free(page);
+            continue;
+        }
+        unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+        uint8_t page_type = ptr[0];
+
+        if (page_type != TABLE_LEAF_PAGE && page_type != TABLE_INTERIOR_PAGE &&
+            page_type != INDEX_LEAF_PAGE && page_type != INDEX_INTERIOR_PAGE)
+        {
+            free(page);
+            continue;
+        }
+
+        uint16_t cell_count = (ptr[OFFSET3] << 8) | ptr[OFFSET4];
+        uint16_t content_area = (ptr[OFFSET5] << 8) | ptr[OFFSET6];
+        if (content_area == 0)
+            content_area = header.page_size;
+
+        int header_offset = (page_type == TABLE_INTERIOR_PAGE || page_type == INDEX_INTERIOR_PAGE) ? 12 : 8;
+        int scan_start = header_offset + 2 * cell_count;
+        int offset = scan_start;
+        int consecutive_zeros = 0;
+
+        int table_index = getSchemaIndexByPage(page_number);
+        if (table_index == -1)
+        {
+            free(page);
+            continue;
+        }
+
+        int printed_header = 0;
+
+        while (offset + 1 < content_area)
+        {
+            if (ptr[offset] == 0x00 && ptr[offset + 1] == 0x00)
+            {
+                consecutive_zeros += 2;
+                if (consecutive_zeros >= 4)
                     break;
-                uint64_t val = 0;
-                for (int b = 0; b < sz; b++)
-                    val = (val << 8) | content[content_offset + b];
-                printf("%llu", val);
-                content_offset += sz;
+                offset++;
+                continue;
             }
             else
             {
-                printf("?");
+                consecutive_zeros = 0;
             }
 
-            if (i < num_columns - 1)
-                printf(", ");
-        }
-        printf(")\n");
+            uint16_t potential_offset = (ptr[offset] << 8) | ptr[offset + 1];
+            if (potential_offset >= header.page_size || potential_offset < header_offset)
+            {
+                offset++;
+                continue;
+            }
 
-        // Skip to next record (very loose guess: entire payload section + headers)
-        offset += header_size + content_offset;
+            ParsedRow row;
+            int consumed = 0;
+            if (parseCell(ptr, potential_offset, table_index, &row, &consumed) && consumed > 0)
+            {
+                if (!printed_header)
+                {
+                    fprintf(csv_stalecells, "\nRecovered from Page no: %d at offset: %d\n", page_number, potential_offset);
+                    fprintf(csv_stalecells, "Possible table: %s\n", objects[table_index].name);
+                    printed_header = 1;
+                }
+
+                for (int i = 0; i < row.column_count; i++)
+                {
+                    fprintf(csv_stalecells, "%s", row.values[i]);
+                    if (i < row.column_count - 1)
+                        fprintf(csv_stalecells, ", ");
+                }
+                fprintf(csv_stalecells, "\n");
+                offset += 2;
+            }
+            else
+            {
+                offset++;
+            }
+        }
+
+        free(page);
     }
 }
+
+/*------------------------------------------------------------------------------------------------------------------------------*/
+
+// void recoverOrphanPages(/*int page_number, int table_index*/)
+// {
+//     printf("\n[ORPHAN PAGE SCAN]\n");
+//     for (int page_number = 2; page_number < header.db_size_pages; page_number++)
+//     {
+//         int table_index = getSchemaIndexByPage(page_number);
+//         // Load page
+//         fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
+//         unsigned char *page = malloc(header.page_size);
+//         if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+//         {
+//             free(page);
+//             return;
+//         }
+
+//         unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+//         uint8_t page_type = ptr[0];
+//         uint16_t num_cells = (ptr[OFFSET3] << 8) | ptr[OFFSET4];
+//         uint16_t content_start = (ptr[OFFSET5] << 8) | ptr[OFFSET6];
+
+//         printf("Orphan Page %d (Type 0x%02X):\n", page_number, page_type);
+
+//         // Case 1: Try to parse like a table leaf
+//         if (page_type == TABLE_LEAF_PAGE || (num_cells == 0 && content_start == header.page_size))
+//         {
+//             // Attempt to parse as data rows
+//             for (int offset = (page_type == TABLE_INTERIOR_PAGE) ? 12 : 8; offset < content_start - 8;)
+//             {
+//                 ParsedRow row;
+//                 int consumed = 0;
+//                 if (parseCell(ptr, offset, table_index, &row, &consumed) && consumed > 0)
+//                 {
+//                     fprintf(csv_orphanpages, "Recovered from orphan page %d at offset %d,", page_number, offset);
+//                     for (int j = 0; j < row.column_count; j++)
+//                     {
+//                         fprintf(csv_orphanpages, "%s", row.values[j]);
+//                         if (j < row.column_count - 1)
+//                             fprintf(csv_orphanpages, ",");
+//                     }
+//                     fprintf(csv_orphanpages, "\n");
+//                     offset += consumed;
+//                 }
+//                 else
+//                 {
+//                     offset++;
+//                 }
+//             }
+//         }
+//         else if (page_type == TABLE_INTERIOR_PAGE || (page_type == TABLE_LEAF_PAGE && num_cells == 0 && content_start == header.page_size))
+//         {
+//             // Suspected interior-like orphan page
+//             printf("  Might contain orphaned child pointers:\n");
+//             int offset = 12;
+//             while (offset + 4 < header.page_size)
+//             {
+//                 uint32_t child_page = (ptr[offset] << 24) | (ptr[offset + 1] << 16) |
+//                                       (ptr[offset + 2] << 8) | ptr[offset + 3];
+//                 if (child_page != 0 && child_page <= header.db_size_pages)
+//                 {
+//                     printf("    ↳ Possibly linked child page: %d\n", child_page);
+//                 }
+//                 offset += 4;
+//             }
+//         }
+//         free(page);
+//     }
+// }
+
+// void recoverOrphanPages()
+// {
+//     for (int page_number = 2; page_number <= header.db_size_pages; page_number++)
+//     {
+//         fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
+//         unsigned char *page = malloc(header.page_size);
+//         if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+//         {
+//             free(page);
+//             continue;
+//         }
+
+//         unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+//         uint8_t page_type = ptr[OFFSET0];
+//         if (page_type != TABLE_LEAF_PAGE && page_type != TABLE_INTERIOR_PAGE &&
+//             page_type != INDEX_LEAF_PAGE && page_type != INDEX_INTERIOR_PAGE)
+//         {
+//             free(page);
+//             continue;
+//         }
+
+//         uint16_t num_cells = (ptr[OFFSET3] << 8) | ptr[OFFSET4];
+//         uint16_t content_start = (ptr[OFFSET5] << 8) | ptr[OFFSET6];
+//         uint32_t right_ptr = (ptr[OFFSET8] << 24) | (ptr[OFFSET9] << 16) | (ptr[OFFSET10] << 8) | ptr[OFFSET11];
+//         if (right_ptr > header.db_size_pages)
+//             page_type == TABLE_LEAF_PAGE;
+
+//         int table_index = getSchemaIndexByPage(page_number);
+
+//         if ((table_index == -1) || (content_start == header.page_size && num_cells == 0))
+//         {
+//             fprintf(csv_orphanpages, "\n[Orphaned Page] Page no: %d\n", page_number);
+//             fprintf(csv_orphanpages, "Possible Table: %s\n", objects[table_index].name);
+//         } //--
+//         else
+//             continue;
+
+//         int header_offset = (page_type == TABLE_INTERIOR_PAGE || page_type == INDEX_INTERIOR_PAGE) ? 12 : 8;
+//         for (int offset = header_offset; offset < content_start;)
+//         {
+//             ParsedRow row;
+//             int consumed = 0;
+//             if (parseCell(ptr, offset, table_index, &row, &consumed) && consumed > 0)
+//             {
+//                 fprintf(csv_orphanpages, "[RECOVERED: Page %d at offset %d],", page_number, offset);
+//                 for (int j = 0; j < row.column_count; j++)
+//                 {
+//                     fprintf(csv_orphanpages, "%s", row.values[j]);
+//                     if (j < row.column_count - 1)
+//                         fprintf(csv_orphanpages, ",");
+//                 }
+//                 fprintf(csv_orphanpages, "\n");
+//                 offset += consumed;
+//             }
+//             else
+//             {
+//                 // Skip nulls
+//                 if (ptr[offset] == 0x00 && ptr[offset + 1] == 0x00)
+//                     offset += 2;
+//                 else
+//                     offset++;
+//             }
+//         }
+//         free(page);
+//     }
+// }
+
+void recoverOrphanPages()
+{
+    for (int page_number = 2; page_number <= header.db_size_pages; page_number++) // Skip page 1
+    {
+        fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
+        unsigned char *page = malloc(header.page_size);
+        if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+        {
+            free(page);
+            continue;
+        }
+        unsigned char *ptr = page;
+        uint8_t page_type = ptr[OFFSET0];
+
+        // Skip pages with invalid types
+        if (page_type != TABLE_LEAF_PAGE && page_type != TABLE_INTERIOR_PAGE &&
+            page_type != INDEX_LEAF_PAGE && page_type != INDEX_INTERIOR_PAGE)
+        {
+            free(page);
+            continue;
+        }
+
+        uint16_t num_cells = (ptr[OFFSET3] << 8) | ptr[OFFSET4];
+        uint16_t content_start = (ptr[OFFSET5] << 8) | ptr[OFFSET6];
+        if (content_start == 0)
+            content_start = header.page_size;
+
+        int schema_index = getSchemaIndexByPage(page_number);
+
+        // Only consider orphans or empty-wiped pages
+        if (!(schema_index == -1 || (num_cells == 0 && content_start == header.page_size)))
+        {
+            free(page);
+            continue;
+        }
+
+        fprintf(csv_orphanpages, "\n[Recovered from Page %d]\n", page_number);
+        if (schema_index != -1)
+        {
+            fprintf(csv_orphanpages, "Possible Table: %s\n", objects[schema_index].name);
+        }
+
+        int offset = 8; // Starting after header (8 or 12 doesn't matter for parseCell)
+        while (offset < header.page_size)
+        {
+            // Skip sequences of 0x00
+            while (offset < header.page_size && ptr[offset] == 0x00)
+                offset++;
+
+            if (offset >= header.page_size)
+                break;
+
+            ParsedRow row;
+            int consumed = 0;
+            if (parseCell(ptr, offset, schema_index, &row, &consumed) && consumed > 0)
+            {
+                for (int j = 0; j < row.column_count; j++)
+                {
+                    fprintf(csv_orphanpages, "%s", row.values[j]);
+                    if (j < row.column_count - 1)
+                        fprintf(csv_orphanpages, ",");
+                }
+                fprintf(csv_orphanpages, "\n");
+                offset += consumed;
+            }
+            else
+            {
+                offset++; // Try next byte
+            }
+        }
+
+        free(page);
+    }
+}
+/*------------------------------------------------------------------------------------------------------------------------------*/

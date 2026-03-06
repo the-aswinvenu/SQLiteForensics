@@ -71,6 +71,8 @@ int getPageType(int page_number) // Function to get the Page Type of the corresp
         // printf("\n %d Index leaf page", page_number);
         return INDEX_LEAF_PAGE;
     }
+    else
+        return 1;
 }
 
 /*------------------------------------------------------------------------------------------------------------------------------*/
@@ -182,8 +184,129 @@ double decodeFloat64(const unsigned char *bytes)
 
 /*------------------------------------------------------------------------------------------------------------------------------*/
 
+void buildOwnedPages()
+{
+    for (int i = 0; i < obj_count; i++)
+    {
+        schemaObjects *obj = &objects[i];
+        obj->owned_page_count = 0;
+        // Use a queue to perform BFS over interior pages
+        int queue[MAX_PAGES_PER_OBJECT];
+        int front = 0, rear = 0;
+
+        queue[rear++] = obj->root_page;
+
+        while (front < rear && obj->owned_page_count < MAX_PAGES_PER_OBJECT)
+        {
+            int page_number = queue[front++];
+            obj->owned_pages[obj->owned_page_count++] = page_number;
+
+            // Read page
+            fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
+            unsigned char *page = malloc(header.page_size);
+            if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+            {
+                free(page);
+                continue;
+            }
+
+            unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+            uint8_t type = ptr[0];
+            if (type == TABLE_INTERIOR_PAGE || type == INDEX_INTERIOR_PAGE)
+            {
+                uint16_t num_cells = (ptr[3] << 8) | ptr[4];
+                for (int c = 0; c < num_cells; c++)
+                {
+                    uint16_t offset = (ptr[8 + c * 2] << 8) | ptr[8 + c * 2 + 1];
+                    if (offset + 4 > header.page_size)
+                        continue;
+                    uint32_t child = (page[offset] << 24) | (page[offset + 1] << 16) |
+                                     (page[offset + 2] << 8) | page[offset + 3];
+                    if (rear < MAX_PAGES_PER_OBJECT)
+                        queue[rear++] = child;
+                }
+
+                // Rightmost pointer
+                uint32_t rightmost = (ptr[8] << 24) | (ptr[9] << 16) |
+                                     (ptr[10] << 8) | ptr[11];
+                if (rear < MAX_PAGES_PER_OBJECT)
+                    queue[rear++] = rightmost;
+            }
+
+            free(page);
+        }
+    }
+}
+
+/*------------------------------------------------------------------------------------------------------------------------------*/
+
+int getSchemaIndexByPage(int page_number)
+{
+    for (int i = 0; i < obj_count; i++)
+    {
+        if (objects[i].root_page == page_number)
+            return i;
+        else
+            for (int j = 0; j < objects[i].owned_page_count; j++)
+            {
+                if (objects[i].owned_pages[j] == page_number)
+                    return i;
+            }
+    }
+    return -1;
+}
+
+/*------------------------------------------------------------------------------------------------------------------------------*/
+
 void closeDBFile()
 {
     if (fp)
         fclose(fp);
 }
+
+/*------------------------------------------------------------------------------------------------------------------------------*/
+
+/*Sample function*/
+void parseCellAtOffset(int page_number, int offset)
+{
+    fseek(fp, (page_number - 1) * header.page_size, SEEK_SET);
+    unsigned char *page = malloc(header.page_size);
+    if (!page || fread(page, 1, header.page_size, fp) != header.page_size)
+    {
+        fprintf(stderr, "Failed to read page %d\n", page_number);
+        free(page);
+        return;
+    }
+    int table_index = getSchemaIndexByPage(page_number);
+    if (table_index == -1)
+    {
+        fprintf(stderr, "Could not determine table index for page %d\n", page_number);
+        free(page);
+        return;
+    }
+
+    ParsedRow row;
+    int consumed = 0;
+    unsigned char *ptr = (page_number == 1) ? page + HEADER_OFFSET : page;
+
+    if (parseCell(ptr, offset, table_index, &row, &consumed))
+    {
+        printf("[VALID CELL] Page: %d Offset: %d (Consumed: %d)\n", page_number, offset, consumed);
+        printf("Values: ");
+        for (int j = 0; j < row.column_count; j++)
+        {
+            printf("%s", row.values[j]);
+            if (j < row.column_count - 1)
+                printf(", ");
+        }
+        printf("\n");
+    }
+    else
+    {
+        printf("[INVALID CELL] Page: %d Offset: %d\n", page_number, offset);
+    }
+
+    free(page);
+}
+
+/*------------------------------------------------------------------------------------------------------------------------------*/

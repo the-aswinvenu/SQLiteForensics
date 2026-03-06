@@ -27,7 +27,13 @@ typedef enum // Enum for constants
     OFFSET9 = 9,
     OFFSET10 = 10,
     OFFSET11 = 11,
+    OFFSET32 = 32,
+    INT_PAGE_HDR_OFFSET = 12,
+    LEAF_PAGE_HDR_OFFSET = 8,
     MAX_FREELIST_PAGES = 1000,
+    MAX_CELL_DATA_LENGTH = 1024,
+    MAX_PAGES_PER_OBJECT = 512,
+    MAX_PAGES = 63000,
 } constValues;
 
 typedef enum // Enum representing different types of B-tree pages
@@ -50,6 +56,7 @@ typedef enum // Enum representing SQLite serial types used in record headers
     SERIAL_TYPE_FLOAT64 = 7,
     SERIAL_TYPE_RESERVED0 = 8,
     SERIAL_TYPE_RESERVED1 = 9,
+    SERIAL_TYPE_BLOB_MIN = 12,
     SERIAL_TYPE_TEXT_MIN = 13 // TEXT fields begin at 13 and increment by 2
 } SerialType;
 
@@ -113,7 +120,15 @@ typedef struct
     char *sql;         // Original CREATE TABLE SQL
     int column_count;
     Column columns[32];
+    int owned_pages[MAX_PAGES_PER_OBJECT]; // NEW: Pages owned by this table/index
+    int owned_page_count;                  // NEW: Count of those pages
 } schemaObjects;
+
+typedef struct
+{
+    char values[MAX_COLUMNS][MAX_CELL_DATA_LENGTH];
+    int column_count;
+} ParsedRow;
 
 /*---------------------- EXTERNAL VARIABLES AND OBJECTS -------------------------------------------------------------------------*/
 
@@ -123,21 +138,42 @@ extern int schemaCount;
 extern int obj_count;
 extern FILE *fp;
 extern FILE *csv_tables;
+extern FILE *csv_stalecells;
+extern FILE *csv_cellslack;
+extern FILE *csv_pageslack;
+extern FILE *csv_freeblock;
+extern FILE *csv_freelist;
+extern FILE *csv_orphanpages;
+
+// extern int visited_pages[];
 
 /*---------------------- FUNCTIONS ----------------------------------------------------------------------------------------------*/
 
-int getDBHeader();                                                     // Function to read the Header File format values
-int getPageType(int page_number);                                      // Function to get the Page Type of the corresponding page number
-uint64_t readVarint(const unsigned char *data, int *bytes_read);       // Function to read a varint from a byte array
-void getSQLiteMaster(int page_number, int id);                         // Function to parse SQLite Master Table (Schema)
-void btreeWalk(int root_page, int idx, void (*leafHandler)(int, int)); // Function to DFS
-void parseTableLeafPage(int page_number, int index);                   // Function to parse table leaf pages
-void extractUserTables();                                              // Function to print SQLite Master Table (Schema)
-void closeDBFile();                                                    // Function to close File
+int getDBHeader();                                               // Function to read the Header File format values
+int getPageType(int page_number);                                // Function to get the Page Type of the corresponding page number
+uint64_t readVarint(const unsigned char *data, int *bytes_read); // Function to read a varint from a byte array
+void getSQLiteMaster(int page_number, int id);                   // Function to parse SQLite Master Table (Schema)
+// void btreeWalk(int root_page, int idx, void (*leafHandler)(int, int)); // Function to DFS
+void btreeWalk(int root_page, int idx, void (*leafHandler)(int, int), int forensic_mode);
+void parseTableLeafPage(int page_number, int index); // Function to parse table leaf pages
+void extractUserTables();                            // Function to print SQLite Master Table (Schema)
+void closeDBFile();                                  // Function to close File
 void getColumnInfo(int tableIndex);
 int isValidType(const char *colType);
-void getFreeblockData();
 void extractCellSlack();
 double decodeFloat64(const unsigned char *bytes);
+void carveFreeblocksRecords();
+void extractPageSlack();
+int parseCell(unsigned char *page, int offset, int table_index, ParsedRow *row, int *consumed_bytes);
+void recoverStaleCells();
+int getSchemaIndexByPage(int page_number);
+void buildOwnedPages();
+void parseFreelistPages();
+void recoverOrphanPages(/*int page_number, int table_index*/);
+
+/*sample function*/
+void parseCellAtOffset(int page_number, int offset);
+
+/*------------------------------------------------------------------------------------------------------------------------------*/
 
 #endif

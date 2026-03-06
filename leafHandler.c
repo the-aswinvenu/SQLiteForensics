@@ -39,7 +39,7 @@ void getSQLiteMaster(int page_number, int id) // Parses the B-tree page and extr
     uint16_t num_cells = (ptr[OFFSET3] << CELL_PTR_ARRAY_OFFSET) | ptr[OFFSET4]; // No. of cells from the 3rd and 4th bytes of the page header
     for (int i = 0; i < num_cells; i++)
     {
-        uint16_t cell_offset = (ptr[CELL_PTR_ARRAY_OFFSET + i * 2] << CELL_PTR_ARRAY_OFFSET) | ptr[CELL_PTR_ARRAY_OFFSET + i * 2 + 1]; // Assinging cell offset
+        uint16_t cell_offset = (ptr[CELL_PTR_ARRAY_OFFSET + i * OFFSET2] << CELL_PTR_ARRAY_OFFSET) | ptr[CELL_PTR_ARRAY_OFFSET + i * OFFSET2 + 1]; // Assinging cell offset
         if (cell_offset >= header.page_size)
         {
             fprintf(stderr, "Invalid cell offset %u at cell %d\n", cell_offset, i);
@@ -179,13 +179,12 @@ void getSQLiteMaster(int page_number, int id) // Parses the B-tree page and extr
 
 /*------------------------------------------------------------------------------------------------------------------------------*/
 
-void parseTableLeafPage(int page_number, int index)
+void parseTableLeafPage(int page_number, int table_index)
 {
     fseek(fp, ((page_number - 1) * header.page_size), SEEK_SET);
     unsigned char *page = malloc(header.page_size);
     if (!page)
         return;
-
     if (fread(page, 1, header.page_size, fp) != header.page_size)
     {
         fprintf(stderr, "Error reading page %d\n", page_number);
@@ -200,106 +199,42 @@ void parseTableLeafPage(int page_number, int index)
         return;
     }
 
-    uint16_t num_cells = (ptr[OFFSET3] << CELL_PTR_ARRAY_OFFSET) | ptr[OFFSET4];
-    int col_count = objects[index].column_count;
+    uint16_t num_cells = (ptr[OFFSET3] << BYTE_SHIFT_8) | ptr[OFFSET4];
+    int col_count = objects[table_index].column_count;
 
-    // Write CSV header only once per table
+    // Write CSV header only once
     static int printed_headers[MAX_TABLES] = {0};
-    if (csv_tables && printed_headers[index] == 0)
+    if (csv_tables && printed_headers[table_index] == 0)
     {
-        fprintf(csv_tables, "%s", objects[index].name);
+        fprintf(csv_tables, "Table Name: %s\n", objects[table_index].name);
         for (int j = 0; j < col_count; j++)
         {
-            fprintf(csv_tables, ",%s", objects[index].columns[j].name);
+            fprintf(csv_tables, "%s", objects[table_index].columns[j].name);
+            if (j < col_count - 1)
+                fprintf(csv_tables, ",");
         }
         fprintf(csv_tables, "\n");
-        printed_headers[index] = 1;
+        printed_headers[table_index] = 1;
     }
 
     for (int i = 0; i < num_cells; i++)
     {
-        uint16_t cell_offset = (ptr[CELL_PTR_ARRAY_OFFSET + i * 2] << BYTE_SHIFT_8) | ptr[CELL_PTR_ARRAY_OFFSET + i * 2 + 1];
-        unsigned char *cell = ptr + cell_offset;
-        int offset = 0, n;
-
-        uint64_t payload_size = readVarint(cell + offset, &n);
-        offset += n;
-        uint64_t rowid = readVarint(cell + offset, &n);
-        offset += n;
-        uint64_t header_size = readVarint(cell + offset, &n);
-        offset += n;
-
-        unsigned char *header = cell + offset;
-        int header_offset = 0;
-        uint64_t serial_types[MAX_COLUMNS];
-
-        for (int j = 0; j < col_count; j++)
+        uint16_t cell_offset = (ptr[OFFSET8 + i * OFFSET2] << OFFSET8) | ptr[OFFSET8 + i * OFFSET2 + 1];
+        ParsedRow row;
+        if (parseCell(page, cell_offset, table_index, &row, NULL))
         {
-            serial_types[j] = readVarint(header + header_offset, &n);
-            header_offset += n;
-        }
-
-        unsigned char *content = cell + offset + header_offset;
-        int content_offset = 0;
-
-        // Write data row
-        if (csv_tables)
-        {
-            fprintf(csv_tables, " ");
-            for (int j = 0; j < col_count; j++)
+            fprintf(csv_tables, "(");
+            for (int j = 0; j < row.column_count; j++)
             {
-                const char *col_type = objects[index].columns[j].type;
-                uint64_t stype = serial_types[j];
-                char field_str[1024] = {0};
-
-                if (stype == 0 && (strcmp(col_type, "INTEGER") == 0 || strcmp(col_type, "INT") == 0))
-                {
-                    snprintf(field_str, sizeof(field_str), "%llu", rowid);
-                }
-                else if (stype >= SERIAL_TYPE_TEXT_MIN && stype % 2 == 1)
-                {
-                    int len = (stype - SERIAL_TYPE_TEXT_MIN) / 2;
-                    memcpy(field_str, content + content_offset, len);
-                    field_str[len] = '\0';
-                    content_offset += len;
-                }
-                else if (stype >= SERIAL_TYPE_INT8 && stype <= SERIAL_TYPE_INT64)
-                {
-                    int size = (stype == SERIAL_TYPE_INT8) ? 1 : (stype == SERIAL_TYPE_INT16) ? 2
-                                                             : (stype == SERIAL_TYPE_INT24)   ? 3
-                                                             : (stype == SERIAL_TYPE_INT32)   ? 4
-                                                             : (stype == SERIAL_TYPE_INT48)   ? 6
-                                                                                              : 8;
-                    uint64_t val = 0;
-                    for (int b = 0; b < size; b++)
-                        val = (val << BYTE_SHIFT_8) | content[content_offset + b];
-                    snprintf(field_str, sizeof(field_str), "%llu", val);
-                    content_offset += size;
-                }
-                else if (stype == SERIAL_TYPE_FLOAT64)
-                {
-                    double dval = decodeFloat64(content + content_offset);
-                    snprintf(field_str, sizeof(field_str), "%f", dval);
-                    content_offset += 8;
-                }
-                else if (stype == SERIAL_TYPE_RESERVED0 || stype == SERIAL_TYPE_RESERVED1)
-                {
-                    snprintf(field_str, sizeof(field_str), "%d", stype-SERIAL_TYPE_RESERVED0);
-                }
-                else
-                {
-                    strcpy(field_str, "NULL");
-                }
-
-                // Quote text in CSV
-                if (stype >= SERIAL_TYPE_TEXT_MIN && stype % 2 == 1)
-                    fprintf(csv_tables, ",\"%s\"", field_str);
-                else
-                    fprintf(csv_tables, ",%s", field_str);
+                fprintf(csv_tables, "%s", row.values[j]);
+                if (j < row.column_count - 1)
+                    fprintf(csv_tables, ",");
             }
-            fprintf(csv_tables, "\n");
+            fprintf(csv_tables, ")\n");
         }
     }
 
     free(page);
 }
+
+/*------------------------------------------------------------------------------------------------------------------------------*/
